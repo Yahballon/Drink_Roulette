@@ -37,7 +37,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           from PIL import Image
-          root=Path("homebrew/drink-roulette")
+          root=Path(".")
           bottle=Image.open(root/"assets/bottle.png").convert("RGBA")
           assert bottle.size==(1024,1024), "Bottle atlas must be square"
           assert all(bottle.getpixel(p)[3]==0 for p in ((0,0),(1023,0),(0,1023),(1023,1023)))
