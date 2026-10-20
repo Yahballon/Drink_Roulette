@@ -1,0 +1,12 @@
+# Build tools, downloaded SDKs and native outputs
+app/
+.deps/
+build/
+dist/
+*.o
+*.elf
+*.self
+*.prx
+*.zip
+__pycache__/
+*.pyc

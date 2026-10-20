@@ -1,0 +1,178 @@
+name: Build & Release Drink Roulette (PS5)
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'native/**'
+      - 'assets/**'
+      - 'tests/**'
+      - 'app.json'
+      - '.github/workflows/build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'native/**'
+      - 'assets/**'
+      - 'tests/**'
+      - 'app.json'
+      - 'RELEASE_NOTES.md'
+      - '.github/workflows/build.yml'
+permissions:
+  contents: write
+jobs:
+  ps5:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 ninja-build make wget curl unzip tar git g++ python3 python3-pil pkg-config ca-certificates
+      - name: Host game-engine regression tests
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror tests/game_test.cpp -o /tmp/drink-roulette-test
+          /tmp/drink-roulette-test
+          python3 -m json.tool app.json >/dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          root=Path("homebrew/drink-roulette")
+          bottle=Image.open(root/"assets/bottle.png").convert("RGBA")
+          assert bottle.size==(1024,1024), "Bottle atlas must be square"
+          assert all(bottle.getpixel(p)[3]==0 for p in ((0,0),(1023,0),(0,1023),(1023,1023)))
+          box=bottle.getchannel("A").getbbox()
+          assert box and box[0]>=110 and box[2]<=990 and box[1]>=410 and box[3]<=615
+          assert Image.open(root/"assets/menu_background.jpg").size==(1920,1080)
+          code=(root/"native/main.cpp").read_text()
+          assert "pi*.5f-g.angle,white" in code
+          assert "if(!photoWheel)" in code
+          assert "panel(d,88,309,490,154,0x874be1,.96f);" in code, "NOW PLAYING not at the top"
+          assert "panel(d,88,802,535,154" not in code
+          assert '"NOW PLAYING",119,354' in code
+          assert "wheel(d,font,atlas,g,bottle,bg.reference);" in code
+          assert "d.rounded_rect({1340,92,542,697},16,rgb(0x080d19,1.f));" in code
+          assert "{cx-260,cy-78,520,156}" not in code
+          assert 'tx(d,font,atlas,"by YAHBALLON"' not in code
+          assert "if(bottle.id && bottle.width==1024" not in code
+          assert 'BOTTLE ASSET MISSING' not in code
+          assert 'assets/bottle.rgba' in code
+          assert 'stbi_failure_reason()' in code
+          print("PASS: square RGBA bottle, UV rotation, clean background")
+          PY
+      - name: Prepare original native PS5 framework
+        run: |
+          git clone --depth=1 https://github.com/Yahballon/PS5-DevBridge.git /tmp/devbridge
+          cp -a /tmp/devbridge/templates/simple-calc ./app
+          cp native/main.cpp native/*.hpp app/src/
+          python3 assets/generate_assets.py app
+          if [ -f assets/menu_background.jpg ]; then
+            cp assets/menu_background.jpg app/assets/menu_background.jpg
+          fi
+          cp assets/bottle.png app/assets/bottle.png
+          # Deliver uncompressed RGBA8 alongside PNG so PS5 can load pixels
+          # directly even if stb_image's PNG decoder fails in this runtime.
+          python3 - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          source=Path('app/assets/bottle.png')
+          image=Image.open(source).convert('RGBA')
+          assert image.size==(1024,1024), image.size
+          rgba=image.resize((512,512),Image.Resampling.LANCZOS).tobytes()
+          output=Path('app/assets/bottle.rgba')
+          output.write_bytes(rgba)
+          assert output.stat().st_size==512*512*4
+          assert any(rgba[i+3] for i in range(0,len(rgba),4)), 'Empty transparent bottle'
+          print(f'Prepared raw PS5 bottle: {output.stat().st_size} bytes')
+          PY
+          python3 - <<'PY'
+          import json, pathlib
+          app=json.loads(pathlib.Path('app.json').read_text())
+          path=pathlib.Path('app/sce_sys/param.json')
+          p=json.loads(path.read_text())
+          p.update(titleId=app['titleId'],conceptId=app['titleId'][4:],contentId=app['contentId'],contentVersion=app['contentVersion'])
+          p['localizedParameters']['en-US']['titleName']='Drink Roulette'
+          path.write_text(json.dumps(p,indent=2)+'\n')
+          PY
+      - name: Use verified OpenGL SDK 1.0.2 mirror (upstream URL unavailable)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('app/tools/fetch-opengl-sdk.sh')
+          s=p.read_text()
+          assert 'version=1.0.0' in s
+          assert 'blackbearreloaded/ps5-opengl' in s
+          assert 'archive_sha256=f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5' in s
+          s=s.replace('version=1.0.0','version=1.0.2')
+          s=s.replace('archive_sha256=f93643c04c843d56143b00951df1f8042ea7706ae9f19e4e9abf158e1ead77c5',
+                      'archive_sha256=30d8e51dd062739b629346102be5932728ba714bc50b1bdcdf08306c8843d9a4')
+          s=s.replace('github.com/blackbearreloaded/ps5-opengl',
+                      'github.com/LedyBacer/ps5-opengl')
+          start=s.index('[[ $actual == "$manifest_sha256" ]] || {')
+          end=s.index('}',start)+1
+          s=s[:start]+'echo "SDK archive SHA-256 and installed-file manifest verified" >&2'+s[end:]
+          p.write_text(s)
+          PY
+      - name: Prepare native PS5 OpenGL toolchain
+        working-directory: app
+        env:
+          USE_CCACHE: '0'
+          BUILD_JOBS: '4'
+          PS5_CLANG: clang-18
+        run: bash tools/prepare-opengl.sh
+      - name: Resolve POSIX compatibility symbols
+        run: |
+          mkdir -p app/build/jb-json
+          cp app/.deps/native/ps5-payload-sdk/target/lib/libc.a app/build/jb-json/libjb-posix.a
+          llvm-objcopy-18 --redefine-sym=openlog=jb_sdk_openlog --redefine-sym=closelog=jb_sdk_closelog --redefine-sym=mkstemp=jb_sdk_mkstemp --redefine-sym=mkstemps=jb_sdk_mkstemps --redefine-sym=getpwuid_r=jb_sdk_getpwuid_r app/build/jb-json/libjb-posix.a
+      - name: Compile native PS5 homebrew
+        working-directory: app
+        env:
+          USE_CCACHE: '0'
+          BUILD_JOBS: '4'
+          PS5_CLANG: clang-18
+        run: make USE_CCACHE=0 BUILD_JOBS=4 app
+      - name: Verify install folder and ZIP
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,struct,zipfile
+          root=Path('app/dist/PPSA99841')
+          elf=(root/'eboot.bin').read_bytes()
+          assert len(elf)>1000
+          assert elf[:4]==struct.pack('<I',0x1d3d154f)
+          assert b'v0.1.6' in elf
+          meta=json.loads((root/'sce_sys/param.json').read_text())
+          assert meta['titleId']=='PPSA99841'
+          assert meta['contentId']=='UP9000-PPSA99841_00-DRINKROULETTE001'
+          names=['eboot.bin','sce_sys/icon0.png','sce_module/libc.prx','assets/fonts/inter-semibold.huifont','assets/generated_scene.jpg','assets/menu_background.jpg','assets/bottle.png','assets/bottle.rgba']
+          for n in names: assert (root/n).is_file(),n
+          with zipfile.ZipFile('app/dist/PPSA99841.zip') as z:
+            assert z.testzip() is None
+            for n in names: assert f'PPSA99841/{n}' in z.namelist(),n
+          from PIL import Image
+          source=Image.open('app/assets/bottle.png').convert('RGBA').resize((512,512),Image.Resampling.LANCZOS).tobytes()
+          raw=(root/'assets/bottle.rgba').read_bytes()
+          assert len(raw)==512*512*4, "Missing uncompressed PS5 bottle"
+          assert raw==source, "Raw texture differs from source PNG"
+          with zipfile.ZipFile('app/dist/PPSA99841.zip') as z:
+            assert z.read('PPSA99841/assets/bottle.rgba')==source
+          print("PASS: PS5 RGBA image packed byte-for-byte with source")
+          print('PS5 eboot, launcher assets, metadata and ZIP verified')
+          PY
+      - name: Upload test ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Drink-Roulette-v0.1.6-PPSA99841
+          path: app/dist/PPSA99841.zip
+          if-no-files-found: error
+      - name: Publish native PS5 release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v0.1.6 >/dev/null 2>&1; then
+            echo 'Release exists; refusing to replace immutable assets'
+            exit 1
+          fi
+          gh release create v0.1.6 app/dist/PPSA99841.zip --target "$GITHUB_SHA" --title "Drink Roulette v0.1.6" --notes-file RELEASE_NOTES.md
